@@ -702,7 +702,7 @@ def render_sidebar():
     # ---- 功能导航 ----
     page = st.sidebar.radio(
         "📌 功能导航",
-        ["📚 智能笔记总结", "✍️ 智能刷题系统", "📊 备考数据看板", "📅 动态学习计划"]
+        ["📚 智能笔记总结", "🔍 PDF题目提取", "✍️ 智能刷题系统", "📊 备考数据看板", "📅 动态学习计划"]
     )
 
     st.sidebar.markdown("---")
@@ -710,12 +710,195 @@ def render_sidebar():
         "**使用说明**\n\n"
         "① 先在 API 配置中填入 Key\n\n"
         "② 笔记总结：上传 PDF/Word，AI 提取考点\n\n"
-        "③ 刷题系统：权重抽题，错题优先推送\n\n"
-        "④ 数据看板：可视化学习进度和正确率\n\n"
-        "⑤ 学习计划：根据考试日期动态生成任务"
+        "③ 题目提取：上传题目PDF，批量导入题库\n\n"
+        "④ 刷题系统：权重抽题，错题优先推送\n\n"
+        "⑤ 数据看板：可视化学习进度和正确率\n\n"
+        "⑥ 学习计划：根据考试日期动态生成任务"
     )
 
     return page
+
+
+# ==================== 题目提取：AI解析PDF中的题目 ====================
+def extract_questions_from_chunk(args):
+    """
+    并行任务：让 AI 从一块文本中提取题目，返回 JSON 列表。
+    """
+    i, chunk, api_key, base_url, model_name, category = args
+    prompt = f"""请从以下公考题目文本中提取所有选择题，严格按照 JSON 格式输出。
+
+要求：
+1. 只提取有完整题目+四个选项+答案的题目
+2. 如果答案不在文本中，跳过该题
+3. 只输出 JSON，不要任何解释文字，不要 markdown 代码块
+
+输出格式（JSON数组）：
+[
+  {{
+    "content": "题目正文",
+    "A": "选项A内容",
+    "B": "选项B内容",
+    "C": "选项C内容",
+    "D": "选项D内容",
+    "answer": "A"
+  }}
+]
+
+文本内容：
+{chunk}
+"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1  # 低温度保证格式稳定
+        )
+        raw = response.choices[0].message.content.strip()
+        # 清理可能的 markdown 代码块包裹
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        import json as _json
+        questions = _json.loads(raw.strip())
+        return (i, questions if isinstance(questions, list) else [])
+    except Exception:
+        return (i, [])
+
+
+def page_extract_questions():
+    """从 PDF 中提取题目并批量导入题库"""
+    st.header("🔍 PDF 题目提取")
+    st.caption("上传含有题目的 PDF，AI 自动识别并批量导入题库")
+
+    if not st.session_state.get('api_key'):
+        st.warning("⚠️ 请先在左侧侧边栏填写并保存 API Key")
+        return
+
+    uploaded_file = st.file_uploader("选择题目 PDF", type=['pdf'], key="extract_uploader")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        category = st.selectbox(
+            "题目科目分类",
+            ["言语理解", "判断推理", "资料分析", "数量关系", "常识判断"],
+            key="extract_category"
+        )
+    with col2:
+        st.info(f"当前题库共 **{get_question_count()}** 道题")
+
+    if not uploaded_file:
+        st.info("请上传题目 PDF 后点击「开始提取」")
+        return
+
+    if st.button("🚀 开始提取题目", type="primary"):
+        # 第一步：解析PDF文本
+        with st.spinner("正在解析 PDF..."):
+            text = extract_text_from_pdf(uploaded_file)
+
+        if not text:
+            st.error("PDF 解析失败，请确认文件包含可选中的文字（非扫描图片）")
+            return
+
+        st.success(f"✅ PDF 解析成功，共 {len(text)} 字")
+
+        # 第二步：分块并行提取题目
+        chunks = chunk_text(text, max_length=6000)  # 题目提取用小块，识别更准
+        total = len(chunks)
+        st.info(f"📦 分成 {total} 块并行处理中...")
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        import concurrent.futures
+        all_questions = []
+        completed = 0
+
+        args_list = [
+            (i, chunk, st.session_state.api_key,
+             st.session_state.base_url, st.session_state.model_name, category)
+            for i, chunk in enumerate(chunks)
+        ]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(extract_questions_from_chunk, args): args[0] for args in args_list}
+            for future in concurrent.futures.as_completed(futures):
+                i, questions = future.result()
+                completed += 1
+                all_questions.extend(questions)
+                progress_bar.progress(completed / total)
+                status_text.text(f"⚡ 已处理 {completed}/{total} 块，累计提取 {len(all_questions)} 道题...")
+
+        progress_bar.empty()
+        status_text.empty()
+
+        if not all_questions:
+            st.error("未能提取到任何题目，请检查：\n1. PDF 中是否有完整的四选一选择题\n2. 题目是否包含答案")
+            return
+
+        # 第三步：预览并确认导入
+        st.success(f"🎉 共提取到 **{len(all_questions)}** 道题目，预览如下：")
+        st.session_state['pending_questions'] = all_questions
+        st.session_state['pending_category'] = category
+
+        # 预览前5道
+        for idx, q in enumerate(all_questions[:5]):
+            with st.expander(f"预览第 {idx+1} 题：{q.get('content', '')[:40]}..."):
+                st.write(f"**题目：** {q.get('content', '')}")
+                for opt in ['A', 'B', 'C', 'D']:
+                    marker = "✅ " if opt == q.get('answer', '') else ""
+                    st.write(f"{marker}**{opt}.** {q.get(opt, '')}")
+                st.write(f"**答案：** {q.get('answer', '')}")
+
+        if len(all_questions) > 5:
+            st.caption(f"... 还有 {len(all_questions)-5} 道题目（确认导入后全部存入题库）")
+
+    # 确认导入按钮（提取完成后显示）
+    if st.session_state.get('pending_questions'):
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ 确认全部导入题库", type="primary"):
+                questions = st.session_state['pending_questions']
+                cat = st.session_state['pending_category']
+                success_count = 0
+                fail_count = 0
+
+                progress = st.progress(0)
+                for idx, q in enumerate(questions):
+                    try:
+                        options = {
+                            "A": q.get("A", ""),
+                            "B": q.get("B", ""),
+                            "C": q.get("C", ""),
+                            "D": q.get("D", "")
+                        }
+                        # 校验：题目和选项都不能为空
+                        if q.get("content") and all(options.values()) and q.get("answer") in ["A","B","C","D"]:
+                            if add_question(cat, q["content"], options, q["answer"]):
+                                success_count += 1
+                            else:
+                                fail_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception:
+                        fail_count += 1
+                    progress.progress((idx + 1) / len(questions))
+
+                progress.empty()
+                st.session_state.pop('pending_questions', None)
+                st.session_state.pop('pending_category', None)
+                st.success(f"🎉 成功导入 **{success_count}** 道题！{'（' + str(fail_count) + ' 道格式不完整已跳过）' if fail_count else ''}")
+                st.balloons()
+                st.rerun()
+
+        with col2:
+            if st.button("❌ 取消，重新提取"):
+                st.session_state.pop('pending_questions', None)
+                st.session_state.pop('pending_category', None)
+                st.rerun()
 
 
 # ==================== 主程序 ====================
@@ -747,6 +930,8 @@ def main():
 
     if page == "📚 智能笔记总结":
         page_note_summary()
+    elif page == "🔍 PDF题目提取":
+        page_extract_questions()
     elif page == "✍️ 智能刷题系统":
         page_practice()
     elif page == "📊 备考数据看板":
