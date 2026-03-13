@@ -269,8 +269,8 @@ def extract_text_from_docx(file):
         return None
 
 
-def chunk_text(text, max_length=8000):
-    """将文本按最大长度分块"""
+def chunk_text(text, max_length=15000):
+    """将文本按最大长度分块，默认15000字减少分块数量"""
     chunks = []
     while len(text) > max_length:
         chunks.append(text[:max_length])
@@ -280,26 +280,14 @@ def chunk_text(text, max_length=8000):
     return chunks
 
 
-def summarize_document(text, api_key, base_url, model_name):
+def call_llm_single(args):
     """
-    逐块调用 LLM 生成结构化 Markdown 总结。
-    每块完成后立即写入 session_state 并渲染，防止页面刷新丢失结果。
+    单块 LLM 调用，用于并行执行。
+    接收 tuple: (index, chunk, api_key, base_url, model_name)
+    返回 (index, result) 保证顺序。
     """
-    if not text:
-        st.error("文档内容为空")
-        return None
-
-    chunks = chunk_text(text)
-    st.session_state.summary_results = []  # 清空旧结果
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    result_container = st.container()
-
-    for i, chunk in enumerate(chunks):
-        status_text.text(f"⏳ 正在处理第 {i+1} / {len(chunks)} 块，预计还需 {(len(chunks)-i-1)*3} 秒...")
-
-        prompt = f"""请对以下公考学习资料进行结构化总结，使用 Markdown 格式输出，包含：
+    i, chunk, api_key, base_url, model_name = args
+    prompt = f"""请对以下公考学习资料进行结构化总结，使用 Markdown 格式输出，包含：
 1. **核心考点**：列出本段的关键知识点（3-5 条）
 2. **重点记忆项**：需要重点背诵的内容（3-5 条）
 3. **易混淆点**：容易出错或混淆的地方（2-3 条）
@@ -309,28 +297,79 @@ def summarize_document(text, api_key, base_url, model_name):
 资料内容：
 {chunk}
 """
-        summary = call_llm(prompt, api_key, base_url, model_name)
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        return (i, response.choices[0].message.content)
+    except Exception as e:
+        return (i, None)
 
-        if summary:
-            block = f"### 第 {i+1} 部分总结\n\n{summary}"
-            st.session_state.summary_results.append(block)
-            # 每块完成后立即展示，不等全部完成
-            with result_container:
-                st.markdown(block)
-                st.markdown("---")
-        else:
-            st.warning(f"第 {i+1} 块处理失败，已跳过")
 
-        progress_bar.progress((i + 1) / len(chunks))
+def summarize_document(text, api_key, base_url, model_name):
+    """
+    并行调用 LLM 生成结构化 Markdown 总结。
+    最多同时发起 5 个请求，速度比串行快 3-5 倍。
+    结果按原始顺序排列后展示。
+    """
+    import concurrent.futures
+
+    if not text:
+        st.error("文档内容为空")
+        return None
+
+    chunks = chunk_text(text)
+    total = len(chunks)
+    st.session_state.summary_results = [None] * total  # 预分配，保证顺序
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text(f"⚡ 并行处理中，共 {total} 块，同时发起最多 5 个请求...")
+
+    # 预先创建占位符，按顺序显示结果
+    placeholders = []
+    result_container = st.container()
+    with result_container:
+        for i in range(total):
+            placeholders.append(st.empty())
+
+    completed = 0
+    args_list = [(i, chunk, api_key, base_url, model_name) for i, chunk in enumerate(chunks)]
+
+    # 并行最多5个线程，避免触发API限流
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(call_llm_single, args): args[0] for args in args_list}
+
+        for future in concurrent.futures.as_completed(futures):
+            i, summary = future.result()
+            completed += 1
+            progress_bar.progress(completed / total)
+
+            if summary:
+                block = f"### 第 {i+1} 部分总结\n\n{summary}"
+                st.session_state.summary_results[i] = block
+                # 在对应位置的占位符中渲染（保证顺序）
+                placeholders[i].markdown(block + "\n\n---")
+                status_text.text(f"⚡ 已完成 {completed} / {total} 块...")
+            else:
+                placeholders[i].warning(f"第 {i+1} 块处理失败，已跳过")
 
     progress_bar.empty()
     status_text.empty()
 
-    if not st.session_state.summary_results:
+    # 过滤掉失败的块
+    final_results = [r for r in st.session_state.summary_results if r]
+    st.session_state.summary_results = final_results
+
+    if not final_results:
         st.error("所有块处理失败，请检查 API 配置是否正确")
         return None
 
-    return "\n\n---\n\n".join(st.session_state.summary_results)
+    return "\n\n---\n\n".join(final_results)
 
 
 # ==================== 页面：智能笔记总结 ====================
