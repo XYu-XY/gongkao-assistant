@@ -706,50 +706,40 @@ def page_extract_questions():
             st.error("未提取到题目，请确认 PDF 含有完整的 ABCD 四选一题目及答案")
             return
 
-        st.success(f"🎉 共提取 **{len(all_questions)}** 道题，预览前5道：")
-        st.session_state['pending_questions'] = all_questions
-        st.session_state['pending_category'] = category
+        # ---- 提取完直接自动导入，无需确认 ----
+        success, fail = 0, 0
+        bar = st.progress(0)
+        import_status = st.empty()
+        for idx, q in enumerate(all_questions):
+            opts = {"A": q.get("A",""), "B": q.get("B",""), "C": q.get("C",""), "D": q.get("D","")}
+            if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
+                if add_question(user['id'], category, q["content"], opts, q["answer"]):
+                    success += 1
+                else:
+                    fail += 1
+            else:
+                fail += 1
+            bar.progress((idx + 1) / len(all_questions))
+            import_status.text(f"正在导入 {idx+1}/{len(all_questions)}...")
 
+        bar.empty()
+        import_status.empty()
+
+        st.success(f"🎉 已自动导入 **{success}** 道题到你的题库！{'（'+str(fail)+' 道格式不完整已跳过）' if fail else ''}")
+        st.balloons()
+
+        # 预览前5道已导入的题目
+        st.markdown("---")
+        st.subheader("📋 已导入题目预览（前5道）")
         for idx, q in enumerate(all_questions[:5]):
-            with st.expander(f"第{idx+1}题：{str(q.get('content',''))[:40]}..."):
+            with st.expander(f"第{idx+1}题：{str(q.get('content',''))[:50]}..."):
                 st.write(f"**题目：** {q.get('content','')}")
                 for opt in ['A','B','C','D']:
                     marker = "✅ " if opt == q.get('answer','') else ""
                     st.write(f"{marker}**{opt}.** {q.get(opt,'')}")
                 st.write(f"**答案：** {q.get('answer','')}")
-
         if len(all_questions) > 5:
-            st.caption(f"... 还有 {len(all_questions)-5} 道（确认后全部导入）")
-
-    if st.session_state.get('pending_questions'):
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("✅ 确认导入题库", type="primary"):
-                questions = st.session_state['pending_questions']
-                cat = st.session_state['pending_category']
-                success, fail = 0, 0
-                bar = st.progress(0)
-                for idx, q in enumerate(questions):
-                    opts = {"A": q.get("A",""), "B": q.get("B",""), "C": q.get("C",""), "D": q.get("D","")}
-                    if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
-                        if add_question(user['id'], cat, q["content"], opts, q["answer"]):
-                            success += 1
-                        else:
-                            fail += 1
-                    else:
-                        fail += 1
-                    bar.progress((idx+1) / len(questions))
-                bar.empty()
-                st.session_state.pop('pending_questions', None)
-                st.session_state.pop('pending_category', None)
-                st.success(f"🎉 成功导入 **{success}** 道！{'（'+str(fail)+' 道格式不完整已跳过）' if fail else ''}")
-                st.balloons()
-                st.rerun()
-        with col2:
-            if st.button("❌ 取消"):
-                st.session_state.pop('pending_questions', None)
-                st.rerun()
+            st.caption(f"... 共 {len(all_questions)} 道，全部已导入题库")
 
 
 # ==================== 页面：智能刷题系统 ====================
