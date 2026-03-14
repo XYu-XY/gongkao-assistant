@@ -102,6 +102,22 @@ def init_database():
         )
     ''')
 
+    # 任务进度表：每块完成后立即写库，切换页面不丢失进度
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS task_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            task_id TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            total_chunks INTEGER NOT NULL,
+            result TEXT,
+            extra TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -458,8 +474,57 @@ def chunk_text(text: str, max_length=15000) -> list:
     return chunks
 
 
-def run_parallel_llm(chunks, api_key, base_url, model_name, prompt_type="summary"):
-    """并行调用 LLM 处理所有块，返回按顺序排列的结果列表"""
+def save_task_chunk(user_id, task_id, task_type, chunk_index, total_chunks, result, extra=None):
+    """每块完成后立即写入数据库，防止切换页面丢失"""
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO task_chunks
+               (user_id, task_id, task_type, chunk_index, total_chunks, result, extra)
+               VALUES (?,?,?,?,?,?,?)""",
+            (user_id, task_id, task_type, chunk_index, total_chunks, result, extra)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        pass  # 写库失败不影响主流程
+
+
+def get_task_chunks(user_id, task_id):
+    """获取某个任务已完成的所有块"""
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chunk_index, total_chunks, result, extra, task_type FROM task_chunks WHERE user_id=? AND task_id=? ORDER BY chunk_index",
+            (user_id, task_id)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def clear_task(user_id, task_id):
+    """清除任务进度（任务完成后调用）"""
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM task_chunks WHERE user_id=? AND task_id=?", (user_id, task_id))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def run_parallel_llm(chunks, api_key, base_url, model_name, prompt_type="summary",
+                     user_id=None, task_id=None, on_chunk_done=None):
+    """
+    并行调用 LLM，每块完成后立即写入数据库。
+    on_chunk_done(i, result): 可选回调，用于实时导入题目等操作。
+    """
     total = len(chunks)
     results = [None] * total
     progress_bar = st.progress(0)
@@ -477,8 +542,18 @@ def run_parallel_llm(chunks, api_key, base_url, model_name, prompt_type="summary
             results[i] = result
             progress_bar.progress(completed / total)
             status_text.text(f"⚡ 已完成 {completed} / {total} 块...")
-            if result and prompt_type == "summary":
-                placeholders[i].markdown(f"### 第 {i+1} 部分\n\n{result}\n\n---")
+
+            if result:
+                # 立即写入数据库，切换页面不丢失
+                if user_id and task_id:
+                    save_task_chunk(user_id, task_id, prompt_type, i, total, result)
+
+                if prompt_type == "summary":
+                    placeholders[i].markdown(f"### 第 {i+1} 部分\n\n{result}\n\n---")
+
+                # 执行回调（如实时导入题目）
+                if on_chunk_done:
+                    on_chunk_done(i, result)
 
     progress_bar.empty()
     status_text.empty()
@@ -589,7 +664,7 @@ def render_sidebar() -> str:
 # ==================== 页面：智能笔记总结 ====================
 def page_note_summary():
     st.header("📚 智能笔记总结")
-    st.caption("上传 PDF 或 Word，AI 自动提取核心考点，总结永久保存")
+    st.caption("上传 PDF 或 Word，AI 自动提取核心考点，每块完成立即保存，切换页面不丢失")
 
     user = st.session_state.user
     api_key = st.session_state.get('api_key', '')
@@ -603,37 +678,76 @@ def page_note_summary():
     with tab_new:
         uploaded_file = st.file_uploader("选择文件（PDF / DOCX）", type=['pdf', 'docx'])
 
+        # 检查是否有未完成的任务（切换页面回来后恢复进度）
+        current_task_id = st.session_state.get('summary_task_id')
+        if current_task_id and not uploaded_file:
+            chunks_done = get_task_chunks(user['id'], current_task_id)
+            if chunks_done:
+                total = chunks_done[0][1]
+                done_count = len(chunks_done)
+                if done_count < total:
+                    st.warning(f"⚠️ 上次任务未完成（已完成 {done_count}/{total} 块），请重新上传文件继续")
+                else:
+                    st.info("上次总结已全部完成，可在「历史总结」中查看")
+            return
+
         if not uploaded_file:
             st.info("请上传文件后点击「开始总结」")
-        else:
-            file_type = uploaded_file.name.split('.')[-1].lower()
-            if st.button("🚀 开始总结", type="primary"):
-                with st.spinner("正在解析文档..."):
-                    text = extract_text_from_pdf(uploaded_file) if file_type == 'pdf' \
-                        else extract_text_from_docx(uploaded_file)
+            return
 
-                if not text:
-                    st.error("文档解析失败（扫描件无法识别，请使用含文字的 PDF）")
-                    return
+        file_type = uploaded_file.name.split('.')[-1].lower()
+        if st.button("🚀 开始总结", type="primary"):
+            with st.spinner("正在解析文档..."):
+                text = extract_text_from_pdf(uploaded_file) if file_type == 'pdf' \
+                    else extract_text_from_docx(uploaded_file)
 
-                chunks = chunk_text(text)
-                st.success(f"✅ 解析成功，共 {len(text)} 字，分 {len(chunks)} 块并行处理")
-                st.markdown("---")
+            if not text:
+                st.error("文档解析失败（扫描件无法识别，请使用含文字的 PDF）")
+                return
 
-                results, _ = run_parallel_llm(
-                    chunks, api_key,
-                    st.session_state.get('base_url', DEFAULT_BASE_URL),
-                    st.session_state.get('model_name', DEFAULT_MODEL_NAME),
-                    prompt_type="summary"
+            chunks = chunk_text(text)
+            # 生成唯一任务ID
+            import hashlib as _hl
+            task_id = _hl.md5(f"{user['id']}_{uploaded_file.name}_{len(text)}".encode()).hexdigest()[:12]
+            st.session_state.summary_task_id = task_id
+
+            # 清除旧的同名任务
+            clear_task(user['id'], task_id)
+
+            st.success(f"✅ 解析成功，共 {len(text)} 字，分 {len(chunks)} 块并行处理")
+            st.markdown("---")
+
+            # 每块完成后立即存入note_summaries（追加模式）
+            filename = uploaded_file.name
+            saved_parts = []
+
+            def on_summary_done(i, result):
+                """每块完成回调：立即追加保存到数据库"""
+                saved_parts.append(f"### 第 {i+1} 部分\n\n{result}")
+
+            results, _ = run_parallel_llm(
+                chunks, api_key,
+                st.session_state.get('base_url', DEFAULT_BASE_URL),
+                st.session_state.get('model_name', DEFAULT_MODEL_NAME),
+                prompt_type="summary",
+                user_id=user['id'],
+                task_id=task_id,
+                on_chunk_done=on_summary_done
+            )
+
+            # 全部完成后整合保存一份完整记录
+            all_chunks = get_task_chunks(user['id'], task_id)
+            if all_chunks:
+                ordered = sorted(all_chunks, key=lambda x: x[0])
+                full_summary = "\n\n---\n\n".join(
+                    [f"### 第 {r[0]+1} 部分\n\n{r[2]}" for r in ordered if r[2]]
                 )
-
-                valid = [f"### 第 {i+1} 部分\n\n{r}" for i, r in enumerate(results) if r]
-                if valid:
-                    full_summary = "\n\n---\n\n".join(valid)
-                    save_note_summary(user['id'], uploaded_file.name, full_summary)
-                    st.success("🎉 总结完成，已永久保存到历史记录！")
-                else:
-                    st.error("总结失败，请检查 API 配置")
+                save_note_summary(user['id'], filename, full_summary)
+                clear_task(user['id'], task_id)
+                st.session_state.pop('summary_task_id', None)
+                st.success("🎉 总结完成，已永久保存到历史记录！")
+            else:
+                st.error("总结失败，请检查 API 配置")
 
     with tab_history:
         summaries = get_note_summaries(user['id'])
@@ -679,17 +793,13 @@ def page_extract_questions():
         chunks = chunk_text(text, max_length=6000)
         st.info(f"📦 分 {len(chunks)} 块并行提取中...")
 
-        results, _ = run_parallel_llm(
-            chunks, api_key,
-            st.session_state.get('base_url', DEFAULT_BASE_URL),
-            st.session_state.get('model_name', DEFAULT_MODEL_NAME),
-            prompt_type="extract"
-        )
+        # 实时导入回调：每块提取完立即写入题库
+        realtime_success = [0]
+        realtime_fail = [0]
+        import_log = st.empty()
 
-        all_questions = []
-        for raw in results:
-            if not raw:
-                continue
+        def on_extract_done(i, raw):
+            """每块提取完成回调：立即解析并导入题目"""
             try:
                 cleaned = raw.strip()
                 if cleaned.startswith("```"):
@@ -697,49 +807,43 @@ def page_extract_questions():
                     if cleaned.startswith("json"):
                         cleaned = cleaned[4:]
                 qs = json.loads(cleaned.strip())
-                if isinstance(qs, list):
-                    all_questions.extend(qs)
+                if not isinstance(qs, list):
+                    return
+                for q in qs:
+                    opts = {"A": q.get("A",""), "B": q.get("B",""), "C": q.get("C",""), "D": q.get("D","")}
+                    if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
+                        if add_question(user['id'], category, q["content"], opts, q["answer"]):
+                            realtime_success[0] += 1
+                        else:
+                            realtime_fail[0] += 1
+                    else:
+                        realtime_fail[0] += 1
+                import_log.info(f"📥 已实时导入 {realtime_success[0]} 道题，跳过 {realtime_fail[0]} 道...")
             except Exception:
-                continue
+                pass
 
-        if not all_questions:
+        import hashlib as _hl
+        task_id = _hl.md5(f"{user['id']}_extract_{uploaded_file.name}".encode()).hexdigest()[:12]
+
+        results, _ = run_parallel_llm(
+            chunks, api_key,
+            st.session_state.get('base_url', DEFAULT_BASE_URL),
+            st.session_state.get('model_name', DEFAULT_MODEL_NAME),
+            prompt_type="extract",
+            user_id=user['id'],
+            task_id=task_id,
+            on_chunk_done=on_extract_done
+        )
+
+        import_log.empty()
+
+        if realtime_success[0] == 0:
             st.error("未提取到题目，请确认 PDF 含有完整的 ABCD 四选一题目及答案")
             return
 
-        # ---- 提取完直接自动导入，无需确认 ----
-        success, fail = 0, 0
-        bar = st.progress(0)
-        import_status = st.empty()
-        for idx, q in enumerate(all_questions):
-            opts = {"A": q.get("A",""), "B": q.get("B",""), "C": q.get("C",""), "D": q.get("D","")}
-            if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
-                if add_question(user['id'], category, q["content"], opts, q["answer"]):
-                    success += 1
-                else:
-                    fail += 1
-            else:
-                fail += 1
-            bar.progress((idx + 1) / len(all_questions))
-            import_status.text(f"正在导入 {idx+1}/{len(all_questions)}...")
-
-        bar.empty()
-        import_status.empty()
-
-        st.success(f"🎉 已自动导入 **{success}** 道题到你的题库！{'（'+str(fail)+' 道格式不完整已跳过）' if fail else ''}")
+        st.success(f"🎉 全部提取完成！已导入 **{realtime_success[0]}** 道题{'，跳过 '+str(realtime_fail[0])+' 道格式不完整的' if realtime_fail[0] else ''}。题目已实时写入，切换页面也不会丢失！")
         st.balloons()
-
-        # 预览前5道已导入的题目
-        st.markdown("---")
-        st.subheader("📋 已导入题目预览（前5道）")
-        for idx, q in enumerate(all_questions[:5]):
-            with st.expander(f"第{idx+1}题：{str(q.get('content',''))[:50]}..."):
-                st.write(f"**题目：** {q.get('content','')}")
-                for opt in ['A','B','C','D']:
-                    marker = "✅ " if opt == q.get('answer','') else ""
-                    st.write(f"{marker}**{opt}.** {q.get(opt,'')}")
-                st.write(f"**答案：** {q.get('answer','')}")
-        if len(all_questions) > 5:
-            st.caption(f"... 共 {len(all_questions)} 道，全部已导入题库")
+        clear_task(user['id'], task_id)
 
 
 # ==================== 页面：智能刷题系统 ====================
