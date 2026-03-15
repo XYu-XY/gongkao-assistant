@@ -602,6 +602,18 @@ def call_llm_single(args):
 
 资料内容：
 {chunk}"""
+    elif prompt_type == "generate":
+        prompt = f"""请根据以下学习资料，自动出5道单选题，要求：
+1. 题目考查资料中的核心知识点
+2. 每题有且仅有4个选项（A/B/C/D），只有1个正确答案
+3. 干扰选项要合理，不能太明显
+4. 严格按JSON数组格式输出，不要任何额外文字、不要markdown代码块
+
+输出格式：
+[{{"content":"题目正文","A":"选项A","B":"选项B","C":"选项C","D":"选项D","answer":"A"}}]
+
+学习资料：
+{chunk}"""
     else:
         prompt = f"""从以下文本中提取所有选择题，严格按JSON数组格式输出，不要任何额外文字。
 格式：[{{"content":"题目","A":"选项A","B":"选项B","C":"选项C","D":"选项D","answer":"A"}}]
@@ -925,7 +937,7 @@ def page_note_summary():
 
 # ==================== PDF 题目提取 ====================
 def page_extract_questions():
-    page_header("🔍 PDF 题目提取", "上传题目 PDF，AI 自动识别并实时导入题库")
+    page_header("🔍 PDF 题目提取 / 自动出题", "上传 PDF，可直接提取题目，或让 AI 根据笔记自动生成选择题")
     user = st.session_state.user
     api_key = st.session_state.get('api_key', '')
 
@@ -933,20 +945,39 @@ def page_extract_questions():
         st.warning("⚠️ 请先在左侧配置 API Key")
         return
 
+    # 模式选择
+    mode = st.radio(
+        "选择模式",
+        ["📋 提取已有题目（PDF中有现成题目）", "✨ AI自动出题（根据笔记/资料生成题目）"],
+        horizontal=True
+    )
+    is_generate = "自动出题" in mode
+
+    st.markdown("---")
+
     col1, col2 = st.columns(2)
     with col1:
-        uploaded_file = st.file_uploader("选择题目 PDF", type=['pdf'])
+        label = "选择笔记/资料 PDF" if is_generate else "选择题目 PDF"
+        uploaded_file = st.file_uploader(label, type=['pdf'])
     with col2:
         existing_cats = get_user_categories(user['id'])
-        cat_hint = "、".join(existing_cats[:3]) if existing_cats else "如：数学、英语..."
+        cat_hint = "、".join(existing_cats[:3]) if existing_cats else "如：计算机网络、数学..."
         category = st.text_input("题目科目", placeholder=f"自由输入，已有：{cat_hint}")
         st.metric("我的题库", f"{get_question_count(user['id'])} 道")
 
+    if is_generate:
+        questions_per_chunk = st.slider("每块生成题目数", min_value=3, max_value=10, value=5)
+        st.caption("💡 文档会被分块处理，每块 AI 生成指定数量的题目")
+
     if not uploaded_file:
-        st.info("📎 请上传含题目的 PDF")
+        if is_generate:
+            st.info("📎 请上传笔记或复习资料 PDF，AI 将自动根据内容出题")
+        else:
+            st.info("📎 请上传含标准选择题（ABCD选项+答案）的 PDF")
         return
 
-    if st.button("🚀 开始提取", type="primary"):
+    btn_label = "✨ 开始生成题目" if is_generate else "🚀 开始提取"
+    if st.button(btn_label, type="primary"):
         if not category.strip():
             st.error("请填写题目科目")
             st.stop()
@@ -957,14 +988,20 @@ def page_extract_questions():
             st.error("PDF 解析失败")
             st.stop()
 
-        chunks = chunk_text(text, max_length=6000)
-        st.info(f"📦 分 {len(chunks)} 块并行提取，题目实时导入题库...")
+        prompt_type = "generate" if is_generate else "extract"
+        chunk_size = 8000 if is_generate else 6000
+        chunks = chunk_text(text, max_length=chunk_size)
+
+        if is_generate:
+            st.info(f"📦 分 {len(chunks)} 块，每块生成约 {questions_per_chunk} 道题，AI 正在出题...")
+        else:
+            st.info(f"📦 分 {len(chunks)} 块并行提取，题目实时导入题库...")
 
         realtime_success = [0]
         realtime_fail = [0]
         import_log = st.empty()
 
-        def on_extract_done(i, raw):
+        def on_done(i, raw):
             try:
                 cleaned = raw.strip()
                 if cleaned.startswith("```"):
@@ -976,37 +1013,42 @@ def page_extract_questions():
                     opts = {"A": q.get("A",""), "B": q.get("B",""),
                             "C": q.get("C",""), "D": q.get("D","")}
                     if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
-                        if add_question(user['id'], category, q["content"], opts, q["answer"]):
+                        if add_question(user['id'], category.strip(), q["content"], opts, q["answer"]):
                             realtime_success[0] += 1
                         else:
                             realtime_fail[0] += 1
                     else:
                         realtime_fail[0] += 1
-                import_log.caption(f"📥 已实时导入 {realtime_success[0]} 道题...")
+                action = "已生成" if is_generate else "已导入"
+                import_log.caption(f"📥 {action} {realtime_success[0]} 道题...")
             except Exception:
                 pass
 
         import hashlib as _hl
-        task_id = _hl.md5(f"{user['id']}_extract_{uploaded_file.name}".encode()).hexdigest()[:12]
+        task_id = _hl.md5(f"{user['id']}_{prompt_type}_{uploaded_file.name}".encode()).hexdigest()[:12]
 
         run_parallel_llm(
             chunks, api_key,
             st.session_state.get('base_url', DEFAULT_BASE_URL),
             st.session_state.get('model_name', DEFAULT_MODEL_NAME),
-            prompt_type="extract",
+            prompt_type=prompt_type,
             user_id=user['id'], task_id=task_id,
-            on_chunk_done=on_extract_done
+            on_chunk_done=on_done
         )
 
         import_log.empty()
         clear_task(user['id'], task_id)
 
         if realtime_success[0] == 0:
-            st.error("未提取到题目，请确认 PDF 含完整的四选一题目及答案")
+            if is_generate:
+                st.error("生成失败，请检查 API 配置或尝试换一份资料")
+            else:
+                st.error("未提取到题目，请确认 PDF 含完整的四选一题目及答案")
         else:
+            action = "生成并导入" if is_generate else "导入"
             st.markdown(f"""<div class="success-banner">
-                🎉 提取完成！成功导入 {realtime_success[0]} 道题
-                {'，跳过 '+str(realtime_fail[0])+' 道格式不完整的' if realtime_fail[0] else ''}
+                🎉 完成！成功{action} <b>{realtime_success[0]}</b> 道题到题库
+                {'，跳过 '+str(realtime_fail[0])+' 道' if realtime_fail[0] else ''}
             </div>""", unsafe_allow_html=True)
             st.balloons()
 
