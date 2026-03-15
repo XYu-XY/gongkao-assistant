@@ -273,12 +273,26 @@ def login_user(username, password):
         cursor.execute('UPDATE users SET last_login=? WHERE id=?', (datetime.now(), user[0]))
         conn.commit()
         conn.close()
-        subjects = json.loads(user[8]) if user[8] else DEFAULT_SUBJECTS
+        # 安全解析 subjects，防止字段顺序不一致或格式错误导致登录失败
+        try:
+            subjects_raw = user[8] if len(user) > 8 else ''
+            subjects = json.loads(subjects_raw) if subjects_raw else DEFAULT_SUBJECTS
+            if not isinstance(subjects, list) or len(subjects) == 0:
+                subjects = DEFAULT_SUBJECTS
+        except Exception:
+            subjects = DEFAULT_SUBJECTS
+
+        try:
+            app_name = user[7] if len(user) > 7 else DEFAULT_APP_NAME
+            app_name = app_name if app_name else DEFAULT_APP_NAME
+        except Exception:
+            app_name = DEFAULT_APP_NAME
+
         return {
             'id': user[0], 'username': user[1],
             'api_key': user[3] or '', 'base_url': user[4] or DEFAULT_BASE_URL,
             'model_name': user[5] or DEFAULT_MODEL_NAME,
-            'app_name': user[6] or DEFAULT_APP_NAME,
+            'app_name': app_name,
             'subjects': subjects,
         }, "登录成功"
     except Exception as e:
