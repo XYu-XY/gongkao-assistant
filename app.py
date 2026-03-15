@@ -462,6 +462,19 @@ def export_questions_csv(user_id, category=None) -> str:
     return output.getvalue()
 
 
+def get_user_categories(user_id):
+    """获取用户已有的科目列表，用于快捷提示"""
+    try:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('SELECT DISTINCT category FROM questions WHERE user_id=? ORDER BY category', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
 # ==================== 统计操作 ====================
 def get_category_stats(user_id):
     try:
@@ -915,7 +928,6 @@ def page_extract_questions():
     page_header("🔍 PDF 题目提取", "上传题目 PDF，AI 自动识别并实时导入题库")
     user = st.session_state.user
     api_key = st.session_state.get('api_key', '')
-    subjects = st.session_state.get('subjects', DEFAULT_SUBJECTS)
 
     if not api_key:
         st.warning("⚠️ 请先在左侧配置 API Key")
@@ -925,7 +937,9 @@ def page_extract_questions():
     with col1:
         uploaded_file = st.file_uploader("选择题目 PDF", type=['pdf'])
     with col2:
-        category = st.selectbox("题目科目", subjects)
+        existing_cats = get_user_categories(user['id'])
+        cat_hint = "、".join(existing_cats[:3]) if existing_cats else "如：数学、英语..."
+        category = st.text_input("题目科目", placeholder=f"自由输入，已有：{cat_hint}")
         st.metric("我的题库", f"{get_question_count(user['id'])} 道")
 
     if not uploaded_file:
@@ -933,12 +947,15 @@ def page_extract_questions():
         return
 
     if st.button("🚀 开始提取", type="primary"):
+        if not category.strip():
+            st.error("请填写题目科目")
+            st.stop()
         with st.spinner("解析 PDF..."):
             text = extract_text_from_pdf(uploaded_file)
 
         if not text:
             st.error("PDF 解析失败")
-            return
+            st.stop()
 
         chunks = chunk_text(text, max_length=6000)
         st.info(f"📦 分 {len(chunks)} 块并行提取，题目实时导入题库...")
@@ -998,12 +1015,12 @@ def page_extract_questions():
 def page_practice():
     page_header("✍️ 智能刷题", "错题权重更高，薄弱知识点优先推送")
     user = st.session_state.user
-    subjects = st.session_state.get('subjects', DEFAULT_SUBJECTS)
-    CATEGORIES = ["全部"] + subjects
 
     with st.expander("➕ 手动添加题目"):
         with st.form("add_q", clear_on_submit=True):
-            cat = st.selectbox("科目", subjects)
+            existing_cats = get_user_categories(user['id'])
+            cat_hint = "、".join(existing_cats[:5]) if existing_cats else "如：数学、英语、历史..."
+            cat = st.text_input("科目名称", placeholder=f"自由输入，已有：{cat_hint}")
             content = st.text_area("题目内容", placeholder="输入题目正文...")
             c1, c2 = st.columns(2)
             with c1:
@@ -1014,8 +1031,8 @@ def page_practice():
                 od = st.text_input("选项 D")
             ans = st.selectbox("正确答案", ["A","B","C","D"])
             if st.form_submit_button("✅ 添加", type="primary"):
-                if all([content, oa, ob, oc, od]):
-                    if add_question(user['id'], cat, content, {"A":oa,"B":ob,"C":oc,"D":od}, ans):
+                if all([content, oa, ob, oc, od]) and cat.strip():
+                    if add_question(user['id'], cat.strip(), content, {"A":oa,"B":ob,"C":oc,"D":od}, ans):
                         st.success("添加成功！")
                         st.rerun()
                 else:
@@ -1023,12 +1040,16 @@ def page_practice():
 
     st.markdown("---")
 
-    col1, col2 = st.columns([2, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        selected_cat = st.selectbox("按科目筛选", CATEGORIES)
+        existing_cats = get_user_categories(user['id'])
+        cat_options = ["全部"] + existing_cats
+        selected_cat = st.selectbox("按科目筛选", cat_options)
     with col2:
         count = get_question_count(user['id'], selected_cat)
         st.metric("题目数量", f"{count} 道")
+    with col3:
+        st.metric("科目数量", f"{len(existing_cats)} 个")
 
     if count == 0:
         st.info("📭 暂无题目，请先通过「PDF 题目提取」或「手动添加」录入")
@@ -1097,12 +1118,11 @@ def page_practice():
 def page_question_bank():
     page_header("📋 题库管理", "查看、导出、删除你的题目")
     user = st.session_state.user
-    subjects = st.session_state.get('subjects', DEFAULT_SUBJECTS)
-    CATEGORIES = ["全部"] + subjects
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        filter_cat = st.selectbox("科目筛选", CATEGORIES)
+        existing_cats = get_user_categories(user['id'])
+        filter_cat = st.selectbox("科目筛选", ["全部"] + existing_cats)
     with col2:
         total = get_question_count(user['id'], filter_cat)
         st.metric("筛选结果", f"{total} 道")
