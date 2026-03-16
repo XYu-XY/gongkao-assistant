@@ -182,7 +182,7 @@ def init_database():
         )
     ''')
 
-    # 题目表
+    # 题目表（question_type: choice=选择题 fill=填空题）
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS questions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,9 +194,16 @@ def init_database():
             correct_count INTEGER DEFAULT 0,
             wrong_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            question_type TEXT DEFAULT 'choice',
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     ''')
+
+    # 兼容旧数据库：如果没有 question_type 列则添加
+    try:
+        cursor.execute("ALTER TABLE questions ADD COLUMN question_type TEXT DEFAULT 'choice'")
+    except Exception:
+        pass
 
     # 答题记录表
     cursor.execute('''
@@ -351,13 +358,14 @@ def get_question_count(user_id, category=None):
         return 0
 
 
-def add_question(user_id, category, content, options, answer):
+def add_question(user_id, category, content, options, answer, question_type='choice'):
+    """添加题目，question_type: choice=选择题, fill=填空题"""
     try:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         cursor = conn.cursor()
         cursor.execute(
-            'INSERT INTO questions (user_id,category,content,options,answer) VALUES (?,?,?,?,?)',
-            (user_id, category, content, json.dumps(options, ensure_ascii=False), answer)
+            'INSERT INTO questions (user_id,category,content,options,answer,question_type) VALUES (?,?,?,?,?,?)',
+            (user_id, category, content, json.dumps(options, ensure_ascii=False), answer, question_type)
         )
         conn.commit()
         conn.close()
@@ -426,7 +434,8 @@ def get_weighted_question(user_id, category=None):
         return {
             'id': selected[0], 'category': selected[2],
             'content': selected[3], 'options': json.loads(selected[4]),
-            'answer': selected[5], 'correct_count': selected[6], 'wrong_count': selected[7]
+            'answer': selected[5], 'correct_count': selected[6], 'wrong_count': selected[7],
+            'question_type': selected[9] if len(selected) > 9 else 'choice'
         }
     except Exception as e:
         st.error(str(e))
@@ -628,6 +637,32 @@ def call_llm_single(args):
 
 学习资料：
 {chunk}"""
+    elif prompt_type == "extract_fill":
+        prompt = f"""请从以下文本中提取所有填空题，严格按JSON数组格式输出，不要任何额外文字。
+
+要求：
+1. 只提取有空格需要填写的题目（如：___、空白处、括号内需填写等）
+2. content字段用____表示空白处
+3. answer字段填写正确答案（多个空用"|"分隔）
+4. 只输出JSON，不要markdown代码块
+
+输出格式：
+[{{"content":"题目正文（____表示空白）","answer":"正确答案"}}]
+
+文本：
+{chunk}"""
+    elif prompt_type == "generate_fill":
+        prompt = f"""请根据以下学习资料，自动出5道填空题，要求：
+1. 考查资料中的核心知识点
+2. 每题留1-3个空，用____表示
+3. 答案要简洁准确
+4. 严格按JSON数组格式输出，不要任何额外文字、不要markdown代码块
+
+输出格式：
+[{{"content":"题目正文（____表示空白）","answer":"正确答案（多空用|分隔）"}}]
+
+学习资料：
+{chunk}"""
     else:
         prompt = f"""从以下文本中提取所有选择题，严格按JSON数组格式输出，不要任何额外文字。
 格式：[{{"content":"题目","A":"选项A","B":"选项B","C":"选项C","D":"选项D","answer":"A"}}]
@@ -646,6 +681,35 @@ def call_llm_single(args):
         return (i, response.choices[0].message.content)
     except Exception as e:
         return (i, None)
+
+
+def ai_grade_fill(user_answer, correct_answer, question_content, api_key, base_url, model_name):
+    """AI智能批改填空题，语义相近即算对"""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        prompt = f"""你是一个严格但公平的批改老师。请判断学生的填空答案是否正确。
+
+题目：{question_content}
+正确答案：{correct_answer}
+学生答案：{user_answer}
+
+判断标准：
+- 语义相同或相近即算正确
+- 关键词正确即算正确
+- 只输出 "correct" 或 "wrong"，不要其他任何文字"""
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=10
+        )
+        result = response.choices[0].message.content.strip().lower()
+        return "correct" in result
+    except Exception:
+        # API失败时降级为字符串匹配
+        return user_answer.strip() in correct_answer or correct_answer.strip() in user_answer
 
 
 def run_parallel_llm(chunks, api_key, base_url, model_name, prompt_type="summary",
@@ -962,10 +1026,24 @@ def page_extract_questions():
     # 模式选择
     mode = st.radio(
         "选择模式",
-        ["📋 提取已有题目（PDF中有现成题目）", "✨ AI自动出题（根据笔记/资料生成题目）"],
-        horizontal=True
+        [
+            "📋 提取选择题（PDF中有现成选择题）",
+            "✨ AI生成选择题（根据笔记自动出题）",
+            "📝 提取填空题（PDF中有现成填空题）",
+            "✏️ AI生成填空题（根据笔记自动出填空题）",
+        ],
+        horizontal=False
     )
-    is_generate = "自动出题" in mode
+    is_generate = "AI生成" in mode
+    is_fill = "填空题" in mode
+    prompt_type_map = {
+        "📋 提取选择题（PDF中有现成选择题）": "extract",
+        "✨ AI生成选择题（根据笔记自动出题）": "generate",
+        "📝 提取填空题（PDF中有现成填空题）": "extract_fill",
+        "✏️ AI生成填空题（根据笔记自动出填空题）": "generate_fill",
+    }
+    prompt_type = prompt_type_map[mode]
+    question_type = "fill" if is_fill else "choice"
 
     st.markdown("---")
 
@@ -1002,7 +1080,6 @@ def page_extract_questions():
             st.error("PDF 解析失败")
             st.stop()
 
-        prompt_type = "generate" if is_generate else "extract"
         chunk_size = 8000 if is_generate else 6000
         chunks = chunk_text(text, max_length=chunk_size)
 
@@ -1024,17 +1101,30 @@ def page_extract_questions():
                 qs = json.loads(cleaned.strip())
                 if not isinstance(qs, list): return
                 for q in qs:
-                    opts = {"A": q.get("A",""), "B": q.get("B",""),
-                            "C": q.get("C",""), "D": q.get("D","")}
-                    if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
-                        if add_question(user['id'], category.strip(), q["content"], opts, q["answer"]):
-                            realtime_success[0] += 1
+                    if question_type == "fill":
+                        # 填空题：只需要content和answer
+                        if q.get("content") and q.get("answer"):
+                            if add_question(user['id'], category.strip(),
+                                          q["content"], {}, q["answer"], "fill"):
+                                realtime_success[0] += 1
+                            else:
+                                realtime_fail[0] += 1
                         else:
                             realtime_fail[0] += 1
                     else:
-                        realtime_fail[0] += 1
-                action = "已生成" if is_generate else "已导入"
-                import_log.caption(f"📥 {action} {realtime_success[0]} 道题...")
+                        # 选择题
+                        opts = {"A": q.get("A",""), "B": q.get("B",""),
+                                "C": q.get("C",""), "D": q.get("D","")}
+                        if q.get("content") and all(opts.values()) and q.get("answer") in ["A","B","C","D"]:
+                            if add_question(user['id'], category.strip(),
+                                          q["content"], opts, q["answer"], "choice"):
+                                realtime_success[0] += 1
+                            else:
+                                realtime_fail[0] += 1
+                        else:
+                            realtime_fail[0] += 1
+                type_label = "填空题" if question_type == "fill" else "选择题"
+                import_log.caption(f"📥 已导入 {realtime_success[0]} 道{type_label}...")
             except Exception:
                 pass
 
@@ -1075,24 +1165,46 @@ def page_practice():
     with st.expander("➕ 手动添加题目"):
         with st.form("add_q", clear_on_submit=True):
             existing_cats = get_user_categories(user['id'])
-            cat_hint = "、".join(existing_cats[:5]) if existing_cats else "如：数学、英语、历史..."
+            cat_hint = "、".join(existing_cats[:3]) if existing_cats else "如：数学、英语..."
             cat = st.text_input("科目名称", placeholder=f"自由输入，已有：{cat_hint}")
-            content = st.text_area("题目内容", placeholder="输入题目正文...")
-            c1, c2 = st.columns(2)
-            with c1:
-                oa = st.text_input("选项 A")
-                ob = st.text_input("选项 B")
-            with c2:
-                oc = st.text_input("选项 C")
-                od = st.text_input("选项 D")
-            ans = st.selectbox("正确答案", ["A","B","C","D"])
+            q_type_input = st.radio("题目类型", ["选择题", "填空题"], horizontal=True)
+            q_content = st.text_area(
+                "题目内容",
+                placeholder="选择题：输入题目正文\n填空题：用____表示空白，如：IPv6地址长度为____bit"
+            )
+            if q_type_input == "选择题":
+                c1, c2 = st.columns(2)
+                with c1:
+                    oa = st.text_input("选项 A")
+                    ob = st.text_input("选项 B")
+                with c2:
+                    oc = st.text_input("选项 C")
+                    od = st.text_input("选项 D")
+                ans = st.selectbox("正确答案", ["A","B","C","D"])
+                fill_ans = ""
+            else:
+                oa = ob = oc = od = ans = ""
+                fill_ans = st.text_input("正确答案", placeholder="多个空用 | 分隔，如：128|IPv6")
+
             if st.form_submit_button("✅ 添加", type="primary"):
-                if all([content, oa, ob, oc, od]) and cat.strip():
-                    if add_question(user['id'], cat.strip(), content, {"A":oa,"B":ob,"C":oc,"D":od}, ans):
+                if not cat.strip() or not q_content.strip():
+                    st.error("请填写科目和题目内容")
+                elif q_type_input == "选择题" and not all([oa, ob, oc, od]):
+                    st.error("请填写全部选项")
+                elif q_type_input == "填空题" and not fill_ans.strip():
+                    st.error("请填写正确答案")
+                else:
+                    if q_type_input == "选择题":
+                        ok = add_question(user['id'], cat.strip(), q_content,
+                                         {"A":oa,"B":ob,"C":oc,"D":od}, ans, "choice")
+                    else:
+                        ok = add_question(user['id'], cat.strip(), q_content,
+                                         {}, fill_ans.strip(), "fill")
+                    if ok:
                         st.success("添加成功！")
                         st.rerun()
-                else:
-                    st.error("请填写全部字段")
+                    else:
+                        st.error("添加失败，请重试")
 
     st.markdown("---")
 
@@ -1137,21 +1249,54 @@ def page_practice():
         st.markdown(f"**{k}.** {v}")
     st.write("")
 
+    q_type = question.get('question_type', 'choice')
+
     if not st.session_state.answered:
-        user_ans = st.radio("请选择答案", ["A","B","C","D"], horizontal=True)
+        if q_type == 'fill':
+            # 填空题答题区
+            st.markdown("**请在下方填写答案：**")
+            # 把____替换成输入提示
+            fill_count = question['content'].count('____')
+            if fill_count > 1:
+                st.caption(f"💡 本题共 {fill_count} 个空，多个答案用 | 分隔")
+            user_ans = st.text_input("你的答案", placeholder="请输入答案，多空用 | 分隔")
+        else:
+            # 选择题答题区
+            user_ans = st.radio("请选择答案", ["A","B","C","D"], horizontal=True)
+
         if st.button("📨 提交答案", type="primary"):
-            is_correct = (user_ans == question['answer'])
-            update_question_stats(user['id'], question['id'], is_correct)
-            st.session_state.user_answer = user_ans
-            st.session_state.answered = True
-            st.rerun()
+            if not user_ans or not user_ans.strip():
+                st.warning("请填写答案后再提交")
+            else:
+                if q_type == 'fill':
+                    # 填空题用AI批改
+                    with st.spinner("AI 正在批改..."):
+                        is_correct = ai_grade_fill(
+                            user_ans,
+                            question['answer'],
+                            question['content'],
+                            st.session_state.get('api_key', ''),
+                            st.session_state.get('base_url', DEFAULT_BASE_URL),
+                            st.session_state.get('model_name', DEFAULT_MODEL_NAME)
+                        )
+                else:
+                    is_correct = (user_ans == question['answer'])
+                update_question_stats(user['id'], question['id'], is_correct)
+                st.session_state.user_answer = user_ans
+                st.session_state.answered = True
+                st.session_state.last_correct = is_correct
+                st.rerun()
     else:
-        is_correct = (st.session_state.user_answer == question['answer'])
+        is_correct = st.session_state.get('last_correct', False)
         if is_correct:
             st.markdown("""<div class="success-banner">✅ 回答正确！</div>""", unsafe_allow_html=True)
         else:
-            st.markdown(f"""<div class="error-banner">❌ 回答错误！正确答案是 <b>{question['answer']}</b></div>""", unsafe_allow_html=True)
+            if q_type == 'fill':
+                st.markdown(f"""<div class="error-banner">❌ 答案不够准确！参考答案：<b>{question['answer']}</b></div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"""<div class="error-banner">❌ 回答错误！正确答案是 <b>{question['answer']}</b></div>""", unsafe_allow_html=True)
 
+        st.caption(f"📝 你的答案：{st.session_state.user_answer}")
         correct_count, wrong_count = get_question_latest_stats(question['id'])
         st.caption(f"📊 本题累计：答对 {correct_count} 次 / 答错 {wrong_count} 次")
 
@@ -1161,6 +1306,7 @@ def page_practice():
                 st.session_state.current_question = get_weighted_question(user['id'], selected_cat)
                 st.session_state.user_answer = None
                 st.session_state.answered = False
+                st.session_state.last_correct = False
                 st.rerun()
         with col2:
             if st.button("🗑️ 删除本题"):
